@@ -163,13 +163,14 @@ def _server_runtime_snapshot() -> dict:
 
 
 def _build_gen_args(
-    request, processor=None, tenant_id: Optional[str] = None
+    request, processor=None, tenant_id: Optional[str] = None, model_config=None
 ) -> GenerationArguments:
     """Build GenerationArguments from a compatible API request."""
     return _request_normalization._build_gen_args(
         request,
         processor=processor,
         tenant_id=tenant_id,
+        model_config=model_config,
         structured_logits_processor_builder=_build_structured_logits_processors,
     )
 
@@ -262,10 +263,17 @@ def _split_thinking(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
+    processor=None,
+    prefix=None,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     return _split_thinking_text(
-        text, thinking_start_token, thinking_end_token, starts_in_thinking
+        text,
+        thinking_start_token,
+        thinking_end_token,
+        starts_in_thinking,
+        processor=processor,
+        prefix=prefix,
     )
 
 

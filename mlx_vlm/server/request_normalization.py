@@ -16,7 +16,6 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import runtime
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
 
@@ -28,7 +27,9 @@ def _request_field_is_set(request, field_name: str) -> bool:
     return getattr(request, field_name, None) is not None
 
 
-def _request_field_or_default(request, field_name: str, default):
+def _request_field_or_default(request, field_name: str, default, model_config=None):
+    if default is None and model_config is not None:
+        default = getattr(model_config, field_name, None)
     fields_set = getattr(request, "model_fields_set", None)
     if fields_set is not None and field_name not in fields_set:
         return default
@@ -72,8 +73,10 @@ def _standard_reasoning_control(
     return None, None, False
 
 
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = runtime.model_cache.get("config")
+def _model_config_field_or_default(
+    processor, field_name: str, default, model_config=None
+):
+    config = model_config
     if config is None and processor is not None:
         config = getattr(processor, "config", None)
     return getattr(config, field_name, default)
@@ -135,6 +138,7 @@ def _build_gen_args(
     request,
     processor=None,
     tenant_id: Optional[str] = None,
+    model_config=None,
     structured_logits_processor_builder=_build_structured_logits_processors,
 ) -> GenerationArguments:
     """Build generation arguments from a compatible API request."""
@@ -162,11 +166,16 @@ def _build_gen_args(
         # off and the request did not express a reasoning preference.
         template_reasoning = True if server_enable_thinking else None
     default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
+        processor, "temperature", DEFAULT_TEMPERATURE, model_config
     )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
+    default_top_p = _model_config_field_or_default(
+        processor, "top_p", DEFAULT_TOP_P, model_config
+    )
+    default_top_k = _model_config_field_or_default(processor, "top_k", 0, model_config)
+    if (
+        _model_config_field_or_default(processor, "do_sample", None, model_config)
+        is False
+    ):
         default_temperature = 0.0
     args = GenerationArguments(
         max_tokens=max_tokens,
@@ -230,10 +239,16 @@ def _build_gen_args(
             request, "thinking_budget", get_server_thinking_budget()
         ),
         thinking_start_token=_request_field_or_default(
-            request, "thinking_start_token", get_server_thinking_start_token()
+            request,
+            "thinking_start_token",
+            get_server_thinking_start_token(),
+            model_config,
         ),
         thinking_end_token=_request_field_or_default(
-            request, "thinking_end_token", get_server_thinking_end_token()
+            request,
+            "thinking_end_token",
+            get_server_thinking_end_token(),
+            model_config,
         ),
         tenant_id=tenant_id,
     )

@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
@@ -27,6 +28,33 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+
+_MUSE_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "fields": {
+        "content": {
+            "close": ["<|eot|>", "<|eom|>"],
+            "content": "text",
+            "open_pattern": r"to=user<\|message\|>",
+        },
+        "reasoning_content": {
+            "close": "<|eom|>",
+            "content": "text",
+            "open_pattern": r"to=self<\|message\|>",
+        },
+    },
+    "start_anchor": "<|start|>assistant",
+}
+
+
+class _MuseResponseTemplateTokenizer:
+    response_template = _MUSE_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
 
 
 @pytest.fixture
@@ -2952,6 +2980,60 @@ def test_chat_completions_response_uses_reasoning_content(client):
     assert message["content"] == "Custom answer."
 
 
+def test_chat_completions_uses_model_config_reasoning_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer())
+    config = SimpleNamespace(
+        model_type="muse_glimmer",
+        thinking_start_token="to=self<|message|>",
+        thinking_end_token="<|eom|>",
+    )
+    monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
+    monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
+    result = GenerationResult(
+        text=(
+            "to=self<|message|>Say exactly: hello world\n\n"
+            "We need to say exactly: hello world ...\n\n"
+            "No extra.<|eom|><|start|>assistant to=user<|message|>hello world"
+        ),
+        prompt_tokens=8,
+        generation_tokens=32,
+        total_tokens=40,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "mlx-community/Muse-Glimmer-30B-4bit",
+                "messages": [{"role": "user", "content": "Say exactly: hello world"}],
+            },
+        )
+
+    assert response.status_code == 200
+    generate_kwargs = mock_generate.call_args.kwargs
+    assert generate_kwargs["thinking_start_token"] == "to=self<|message|>"
+    assert generate_kwargs["thinking_end_token"] == "<|eom|>"
+    message = response.json()["choices"][0]["message"]
+    expected_reasoning = (
+        "Say exactly: hello world\n\n"
+        "We need to say exactly: hello world ...\n\n"
+        "No extra."
+    )
+    assert message["reasoning_content"] == expected_reasoning
+    assert message["reasoning"] == expected_reasoning
+    assert message["content"] == "hello world"
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
@@ -5764,33 +5846,21 @@ class TestResponseGenerator:
         for key, value in expected.items():
             assert args.to_generate_kwargs()[key] == value
 
-    def test_build_gen_args_uses_model_generation_config_when_omitted(
-        self, monkeypatch
-    ):
-        monkeypatch.setitem(
-            server.runtime.model_cache,
-            "config",
-            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
-        )
+    def test_build_gen_args_uses_model_generation_config_when_omitted(self):
+        config = SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64)
         req = server.ChatRequest(
             model="demo",
             messages=[server.ChatMessage(role="user", content="hi")],
         )
 
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, model_config=config)
 
         assert args.temperature == 1.0
         assert args.top_p == 0.95
         assert args.top_k == 64
 
-    def test_build_gen_args_request_sampling_overrides_model_generation_config(
-        self, monkeypatch
-    ):
-        monkeypatch.setitem(
-            server.runtime.model_cache,
-            "config",
-            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
-        )
+    def test_build_gen_args_request_sampling_overrides_model_generation_config(self):
+        config = SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64)
         req = server.ChatRequest(
             model="demo",
             messages=[server.ChatMessage(role="user", content="hi")],
@@ -5799,7 +5869,7 @@ class TestResponseGenerator:
             top_k=0,
         )
 
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, model_config=config)
 
         assert args.temperature == 0.0
         assert args.top_p == 1.0
@@ -5894,6 +5964,10 @@ class TestResponseGenerator:
     def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
         self, monkeypatch
     ):
+        config = SimpleNamespace(
+            thinking_start_token="<model-analysis>",
+            thinking_end_token="</model-analysis>",
+        )
         monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
         monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
         monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
@@ -5905,11 +5979,28 @@ class TestResponseGenerator:
         assert "thinking_budget" not in req.model_fields_set
         assert "thinking_start_token" not in req.model_fields_set
         assert "thinking_end_token" not in req.model_fields_set
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, model_config=config)
 
         assert args.thinking_budget == 256
         assert args.thinking_start_token == "<analysis>"
         assert args.thinking_end_token == "</analysis>"
+
+    def test_build_gen_args_uses_model_thinking_tokens_when_omitted(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
+        monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
+        config = SimpleNamespace(
+            thinking_start_token="to=self<|message|>",
+            thinking_end_token="<|eom|>",
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req, model_config=config)
+
+        assert args.thinking_start_token == "to=self<|message|>"
+        assert args.thinking_end_token == "<|eom|>"
 
     def test_build_gen_args_request_thinking_overrides_server_default(
         self, monkeypatch
@@ -6383,6 +6474,21 @@ class TestSplitThinking:
         assert reasoning == "Custom reasoning."
         assert content == "Custom answer."
 
+    def test_muse_harmony_markers(self):
+        text = (
+            "to=self<|message|>Muse reasoning.<|eom|>"
+            "<|start|>assistant to=user<|message|>Muse answer."
+        )
+        reasoning, content = server._split_thinking(
+            text,
+            "to=self<|message|>",
+            "<|eom|>",
+            processor=SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
+            prefix="<|start|>assistant",
+        )
+        assert reasoning == "Muse reasoning."
+        assert content == "Muse answer."
+
     def test_cohere_thinking_markers_strip_text_markers(self):
         text = (
             "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
@@ -6470,6 +6576,30 @@ class TestThinkingStreamState:
         assert second.reasoning == "Custom reasoning."
         assert second.content == "Custom answer."
         assert second.thinking_closed is True
+
+    def test_muse_harmony_markers_split_across_chunks(self):
+        state = server.make_response_stream_state(
+            SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
+            "<|start|>assistant",
+            thinking_start_token="to=self<|message|>",
+            thinking_end_token="<|eom|>",
+        )
+        reasoning = []
+        content = []
+
+        for chunk in (
+            "to=self<|mes",
+            "sage|>Muse reasoning.<|eom|><|start|>assistant ",
+            "to=user<|message|>Muse answer.",
+        ):
+            delta = state.feed(chunk)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == "Muse reasoning."
+        assert "".join(content) == "Muse answer."
 
     def test_cohere_text_markers_are_suppressed_across_chunks(self):
         state = server.ThinkingStreamState(enable_thinking=True)
