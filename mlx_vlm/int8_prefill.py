@@ -1,7 +1,8 @@
 """Selective W8A8 int8 prefill on Apple M5 neural accelerators (NAX).
 
-For prefill-sized calls on the large language-model projections (MLP and,
-with the default "all" scope, the attention/linear-attention projections),
+For prefill-sized calls on selected large language-model projections (MLP by
+default, or attention/linear-attention projections with the opt-in "all"
+scope),
 replaces the 4-bit quantized matmul with an int8 x int8 -> int32 GEMM running
 on the M5 GPU neural accelerators via Metal Performance Primitives tensor ops:
 
@@ -17,8 +18,8 @@ on the M5 GPU neural accelerators via Metal Performance Primitives tensor ops:
   - accumulation int32, scales applied in-register, bf16 output
 
 Decode-sized calls (rows < ROW_THRESHOLD) keep the 4-bit quantized kernels,
-so decode speed and numerics are completely unchanged. Attention, lm_head,
-embeddings and the vision tower are untouched.
+so decode speed and numerics are completely unchanged. The default MLP scope
+also leaves attention, lm_head, embeddings and the vision tower untouched.
 
 Measured on M5 Max (research/int8-nax/): int8 GEMM ~91 TOPS-eq vs ~58 TF for
 MLX's bf16 NAX GEMM at the MLP shapes; fused (quant + GEMM) 1.49x over bf16
@@ -48,13 +49,16 @@ logger = logging.getLogger(__name__)
 ROW_THRESHOLD = 512
 
 # Scope of layers routed to W8A8 (env MLX_VLM_INT8_SCOPE):
-#   "all" (default): every large language-model projection — MLP plus
+#   "all": every large projection — MLP plus
 #       attention/linear-attention (q/k/v/o, in_proj_qkv/z, out_proj).
 #   "mlp": only the MLP projections (gate/up 5120->17408, down 17408->5120),
 #       the more conservative choice if a quality eval flags "all".
 # Either way lm_head is excluded (N > MAX_OUT) and tiny projections such as
 # linear_attn.in_proj_a/b (N=48) fail the N % 128 tile requirement.
-SCOPE = os.environ.get("MLX_VLM_INT8_SCOPE", "all")
+# Default to the validated Qwen3.6 MLP shapes. ``all`` is a broader research
+# mode: the process-wide QuantizedLinear hook cannot distinguish a language
+# projection from a same-shaped vision projection.
+SCOPE = os.environ.get("MLX_VLM_INT8_SCOPE", "mlp")
 MLP_SHAPES = {(17408, 5120), (5120, 17408)}
 MAX_OUT = 32768
 MIN_DIM = 1024
@@ -69,6 +73,7 @@ MIN_DIM = 1024
 #       seconds without an int8-path call; fastest, highest peak memory.
 CACHE = os.environ.get("MLX_VLM_INT8_CACHE", "none")
 TTL_S = float(os.environ.get("MLX_VLM_INT8_TTL_S", "120"))
+ACT_TTL_S = float(os.environ.get("MLX_VLM_INT8_ACT_TTL_S", "5"))
 
 _HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -206,6 +211,7 @@ _int8_weights = {}
 _weights_lock = threading.Lock()
 _last_use = 0.0
 _reaper_started = False
+_original_quantized_linear_call = None
 
 
 def _touch():
@@ -215,12 +221,12 @@ def _touch():
 
 def _reaper():
     while True:
-        time.sleep(max(TTL_S / 4.0, 5.0))
+        time.sleep(max(min(TTL_S, ACT_TTL_S) / 4.0, 1.0))
         with _weights_lock:
-            if _int8_weights and time.monotonic() - _last_use > TTL_S:
+            idle = time.monotonic() - _last_use
+            if _int8_weights and idle > TTL_S:
                 n = len(_int8_weights)
                 _int8_weights.clear()
-                _act_cache.clear()
                 mx.clear_cache()
                 logger.info(
                     "int8 NAX prefill: evicted %d int8 weight copies after "
@@ -228,11 +234,14 @@ def _reaper():
                     n,
                     TTL_S,
                 )
+            if _act_cache and idle > ACT_TTL_S:
+                _act_cache.clear()
+                mx.clear_cache()
 
 
 def _start_reaper():
     global _reaper_started
-    if TTL_S > 0 and not _reaper_started:
+    if (TTL_S > 0 or ACT_TTL_S > 0) and not _reaper_started:
         _reaper_started = True
         threading.Thread(
             target=_reaper, name="int8-prefill-reaper", daemon=True
@@ -378,7 +387,9 @@ def _eligible(m: nn.Module, k_dim: int) -> bool:
 # it once and reuse. Entries hold a strong reference to the input, so the
 # id() key stays valid for the entry's lifetime.
 _act_cache = OrderedDict()
-_ACT_CACHE_SIZE = 4
+# One entry is enough to reuse a shared activation across q/k/v or gate/up,
+# while bounding the strong-reference tail to one prefill tensor.
+_ACT_CACHE_SIZE = 1
 
 
 def _quantize_rows_cached(x, k_dim):
@@ -396,13 +407,29 @@ def _quantize_rows_cached(x, k_dim):
 
 def apply():
     """Patch nn.QuantizedLinear to route eligible prefill calls to W8A8."""
-    ql_orig = nn.QuantizedLinear.__call__
+    global _original_quantized_linear_call
+    if _original_quantized_linear_call is not None:
+        return False
+    device_name = str(mx.device_info().get("device_name", ""))
+    if "M5" not in device_name:
+        raise RuntimeError(
+            "int8 NAX prefill requires an Apple M5-class GPU; "
+            f"found {device_name or 'unknown device'}"
+        )
+    _original_quantized_linear_call = nn.QuantizedLinear.__call__
 
     def ql_call(self, x):
         k_dim = x.shape[-1]
         rows = x.size // k_dim
-        if rows < ROW_THRESHOLD or not _eligible(self, k_dim):
-            return ql_orig(self, x)
+        # The custom epilogue writes bfloat16. Fall back rather than silently
+        # changing fp16/fp32 model semantics.
+        if (
+            x.dtype != mx.bfloat16
+            or rows < ROW_THRESHOLD
+            or not _eligible(self, k_dim)
+        ):
+            return _original_quantized_linear_call(self, x)
+        _touch()
         wq, ws = _weights_for(self)
         xq, xs = _quantize_rows_cached(x, k_dim)
         bias = self["bias"] if "bias" in self else None
@@ -410,8 +437,7 @@ def apply():
         return y.reshape(*x.shape[:-1], wq.shape[0])
 
     nn.QuantizedLinear.__call__ = ql_call
-    if CACHE == "ttl":
-        _start_reaper()
+    _start_reaper()
     logger.info(
         "int8 NAX prefill patch applied (row threshold %d, scope %s, "
         "weight cache %s%s)",
@@ -420,6 +446,22 @@ def apply():
         CACHE,
         f", TTL {TTL_S:.0f}s" if CACHE == "ttl" else "",
     )
+    return True
+
+
+def remove():
+    """Restore the original QuantizedLinear call and release overlay caches."""
+    global _original_quantized_linear_call
+    if _original_quantized_linear_call is None:
+        return False
+    nn.QuantizedLinear.__call__ = _original_quantized_linear_call
+    _original_quantized_linear_call = None
+    with _weights_lock:
+        _int8_weights.clear()
+        _ws_cache.clear()
+        _act_cache.clear()
+    mx.clear_cache()
+    return True
 
 
 def warmup(model: nn.Module):
