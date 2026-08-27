@@ -14,7 +14,9 @@ on the M5 GPU neural accelerators via Metal Performance Primitives tensor ops:
     after its GEMM consumes it, so peak extra memory is a few hundred MB
     (one layer), not the ~24 GB of a full copy. MLX_VLM_INT8_CACHE=ttl
     instead caches all copies and evicts them after MLX_VLM_INT8_TTL_S idle.
-    Only the per-channel scales (~10 MB total) are kept permanently.
+    Only the per-channel scales (~10 MB total) are kept across calls; the
+    reaper evicts them after the same idle TTL and drops entries whose
+    module has been freed.
   - accumulation int32, scales applied in-register, bf16 output
 
 Decode-sized calls (rows < ROW_THRESHOLD) keep the 4-bit quantized kernels,
@@ -35,6 +37,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections import OrderedDict
 
 import mlx.core as mx
@@ -205,12 +208,16 @@ _TM, _TN, _NSIMD = 128, 128, 8
 _quant_kernels = {}
 _gemm_kernels = {}
 _requant_kernels = {}
-# id(module) -> (wq int8 [N,K], ws fp32 [N]); modules live for server
-# lifetime, entries are evicted after TTL_S idle (see _reaper).
+# id(module) -> (weakref.ref(module), wq int8 [N,K], ws fp32 [N]). id() alone
+# is not a safe key: after a model swap CPython can hand a new module a freed
+# module's id(), so entries are only served when the stored referent is the
+# calling module, and the reaper drops entries whose module has been freed
+# (plus the TTL_S idle eviction).
 _int8_weights = {}
 _weights_lock = threading.Lock()
 _last_use = 0.0
 _reaper_started = False
+_reaper_stop = None
 _original_quantized_linear_call = None
 
 
@@ -219,32 +226,48 @@ def _touch():
     _last_use = time.monotonic()
 
 
-def _reaper():
-    while True:
-        time.sleep(max(min(TTL_S, ACT_TTL_S) / 4.0, 1.0))
-        with _weights_lock:
-            idle = time.monotonic() - _last_use
-            if _int8_weights and idle > TTL_S:
-                n = len(_int8_weights)
-                _int8_weights.clear()
-                mx.clear_cache()
+def _reap_once():
+    with _weights_lock:
+        idle = time.monotonic() - _last_use
+        # Entries whose module has been freed go every pass, idle or not: a
+        # later model's module can reuse the dead module's id(), and a stale
+        # entry must never outlive its module.
+        for cache in (_int8_weights, _ws_cache):
+            for key, entry in list(cache.items()):
+                if entry[0]() is None:
+                    cache.pop(key, None)
+        if idle > TTL_S and (_int8_weights or _ws_cache):
+            if _int8_weights:
                 logger.info(
                     "int8 NAX prefill: evicted %d int8 weight copies after "
                     "%.0fs idle",
-                    n,
+                    len(_int8_weights),
                     TTL_S,
                 )
-            if _act_cache and idle > ACT_TTL_S:
-                _act_cache.clear()
-                mx.clear_cache()
+            _int8_weights.clear()
+            _ws_cache.clear()
+            mx.clear_cache()
+        if _act_cache and idle > ACT_TTL_S:
+            _act_cache.clear()
+            mx.clear_cache()
+
+
+def _reaper(stop):
+    interval = max(min(TTL_S, ACT_TTL_S) / 4.0, 1.0)
+    while not stop.wait(interval):
+        _reap_once()
 
 
 def _start_reaper():
-    global _reaper_started
+    global _reaper_started, _reaper_stop
     if (TTL_S > 0 or ACT_TTL_S > 0) and not _reaper_started:
         _reaper_started = True
+        _reaper_stop = threading.Event()
         threading.Thread(
-            target=_reaper, name="int8-prefill-reaper", daemon=True
+            target=_reaper,
+            args=(_reaper_stop,),
+            name="int8-prefill-reaper",
+            daemon=True,
         ).start()
 
 
@@ -300,7 +323,11 @@ def _int8_gemm(xq, xs, wq, ws, bias=None):
     )[0]
 
 
-# id(module) -> ws fp32 [N]; tiny (~10 MB total), kept for server lifetime.
+# id(module) -> (weakref.ref(module), ws fp32 [N]); tiny (~10 MB total).
+# Entries are validated against the live module on lookup (id() reuse after a
+# model swap must not resurrect the previous model's scales) and evicted by
+# the reaper (dead modules every pass, everything after TTL_S idle) and by
+# remove().
 _ws_cache = {}
 
 
@@ -309,14 +336,15 @@ def _ws_for(m: nn.Module):
     computed from the affine group scales/biases alone (no dequantization).
     Within a group max|w| <= max(|bias|, |15*scale + bias|); slightly coarser
     than the exact absmax, but safe and essentially free to compute."""
-    ws = _ws_cache.get(id(m))
-    if ws is None:
-        s = m["scales"].astype(mx.float32)
-        b = m["biases"].astype(mx.float32)
-        bound = mx.maximum(mx.abs(b), mx.abs(15.0 * s + b))
-        ws = mx.maximum(bound.max(axis=1), 1e-8) / 127.0
-        mx.eval(ws)
-        _ws_cache[id(m)] = ws
+    entry = _ws_cache.get(id(m))
+    if entry is not None and entry[0]() is m:
+        return entry[1]
+    s = m["scales"].astype(mx.float32)
+    b = m["biases"].astype(mx.float32)
+    bound = mx.maximum(mx.abs(b), mx.abs(15.0 * s + b))
+    ws = mx.maximum(bound.max(axis=1), 1e-8) / 127.0
+    mx.eval(ws)
+    _ws_cache[id(m)] = (weakref.ref(m), ws)
     return ws
 
 
@@ -358,12 +386,12 @@ def _weights_for(m: nn.Module):
     _touch()
     with _weights_lock:
         entry = _int8_weights.get(id(m))
-        if entry is None:
+        if entry is None or entry[0]() is not m:
             wq = _requant(m, ws)
             mx.eval(wq)
-            entry = (wq, ws)
+            entry = (weakref.ref(m), wq, ws)
             _int8_weights[id(m)] = entry
-    return entry
+    return entry[1], entry[2]
 
 
 def _eligible(m: nn.Module, k_dim: int) -> bool:
@@ -450,18 +478,39 @@ def apply():
 
 
 def remove():
-    """Restore the original QuantizedLinear call and release overlay caches."""
-    global _original_quantized_linear_call
+    """Restore the original QuantizedLinear call, release overlay caches and
+    stop the reaper thread (a later apply() starts a fresh one)."""
+    global _original_quantized_linear_call, _reaper_started, _reaper_stop
     if _original_quantized_linear_call is None:
         return False
     nn.QuantizedLinear.__call__ = _original_quantized_linear_call
     _original_quantized_linear_call = None
+    if _reaper_stop is not None:
+        _reaper_stop.set()
+        _reaper_stop = None
+    _reaper_started = False
     with _weights_lock:
         _int8_weights.clear()
         _ws_cache.clear()
         _act_cache.clear()
     mx.clear_cache()
     return True
+
+
+def release(reapply: bool = True):
+    """Model-unload boundary hook for the server.
+
+    Runs remove() to restore nn.QuantizedLinear.__call__ and flush every
+    id()-keyed overlay cache — after a swap, a new model's module can reuse a
+    freed module's id() and must never inherit the previous model's scales or
+    int8 weights. Unless ``reapply`` is False (process shutdown), the patch is
+    then reinstalled with empty caches so the next model keeps int8 prefill.
+    A no-op returning False when the overlay was never applied.
+    """
+    removed = remove()
+    if removed and reapply:
+        apply()
+    return removed
 
 
 def warmup(model: nn.Module):

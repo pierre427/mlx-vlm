@@ -437,6 +437,9 @@ async def lifespan(app):
         if runtime.realtime_engine is not None:
             runtime.realtime_engine.stop_and_join()
             runtime.realtime_engine = None
+        # Process shutdown: restore QuantizedLinear, flush overlay caches
+        # and stop the reaper thread without reinstalling the patch.
+        _release_int8_prefill_overlay(reapply=False)
 
 
 app = FastAPI(
@@ -461,6 +464,21 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 
 
 _INHERIT_ADAPTER = object()
+
+
+def _release_int8_prefill_overlay(*, reapply: bool = True) -> bool:
+    """Flush the int8 prefill overlay at a model-unload boundary.
+
+    The overlay caches per-channel scales (and, with MLX_VLM_INT8_CACHE=ttl,
+    int8 weight copies) keyed by module identity; entries must not outlive the
+    model that owned them. release() runs remove() (restore + flush) and, when
+    ``reapply`` is set, reinstalls the patch with empty caches so the next
+    model keeps int8 prefill; pass reapply=False at process shutdown. A no-op
+    when the overlay was never applied.
+    """
+    from ..int8_prefill import release
+
+    return release(reapply=reapply)
 
 
 def _unload_model_cache_group(cache_group: str) -> bool:
@@ -502,6 +520,9 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
+    # Drop the int8 prefill overlay's per-module caches before the freed
+    # modules' ids can be reused by the next model.
+    _release_int8_prefill_overlay()
     gc.collect()
     mx.clear_cache()
     return True
@@ -581,7 +602,8 @@ def get_cached_model(
             cached_cache["config"],
         )
 
-    # If this kind has a different model cached, clear only that cache group.
+    # If this kind has a different model cached, clear only that cache group
+    # (this also releases the int8 prefill overlay's per-module caches).
     if cached_cache:
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
@@ -920,8 +942,15 @@ def unload_model_sync():
             unloaded_any = True
 
     registry = _model_cache_registry()
+    released_overlay = False
     for cache_group, _ in list(registry.items()):
-        unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
+        if _unload_model_cache_group(cache_group):
+            unloaded_any = True
+            released_overlay = True
+    if not released_overlay:
+        # No cache group was registered, but the overlay may still hold
+        # per-module state (e.g. after a warmup without a tracked load).
+        _release_int8_prefill_overlay()
 
     runtime.response_generator = None
     runtime.apc_manager = None

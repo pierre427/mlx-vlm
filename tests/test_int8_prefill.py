@@ -1,4 +1,8 @@
+import ast
+import gc
 import importlib.util
+import time
+import weakref
 from pathlib import Path
 
 import mlx.core as mx
@@ -14,11 +18,19 @@ int8_prefill = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(int8_prefill)
 
 
+def _clear_overlay_caches():
+    int8_prefill._int8_weights.clear()
+    int8_prefill._ws_cache.clear()
+    int8_prefill._act_cache.clear()
+
+
 @pytest.fixture(autouse=True)
 def restore_quantized_linear():
     int8_prefill.remove()
+    _clear_overlay_caches()
     yield
     int8_prefill.remove()
+    _clear_overlay_caches()
 
 
 def _small_w4_linear():
@@ -28,6 +40,21 @@ def _small_w4_linear():
     linear.scales = linear.scales.astype(mx.bfloat16)
     linear.biases = linear.biases.astype(mx.bfloat16)
     return linear
+
+
+def _expected_ws(linear):
+    s = linear["scales"].astype(mx.float32)
+    b = linear["biases"].astype(mx.float32)
+    bound = mx.maximum(mx.abs(b), mx.abs(15.0 * s + b))
+    return mx.maximum(bound.max(axis=1), 1e-8) / 127.0
+
+
+def _fake_m5(monkeypatch):
+    monkeypatch.setattr(
+        int8_prefill.mx,
+        "device_info",
+        lambda: {"device_name": "Apple M5 Max"},
+    )
 
 
 @pytest.mark.skipif(
@@ -51,7 +78,9 @@ def test_int8_prefill_is_bounded_reversible_and_close(monkeypatch):
         actual.astype(mx.float32) - reference.astype(mx.float32)
     ) / mx.maximum(mx.linalg.norm(reference.astype(mx.float32)), 1e-8)
     assert float(rel_l2) < 0.03
-    assert len(int8_prefill._int8_weights) == 0
+    # CACHE=none frees each int8 copy after its GEMM; CACHE=ttl keeps it.
+    expected_copies = 1 if int8_prefill.CACHE == "ttl" else 0
+    assert len(int8_prefill._int8_weights) == expected_copies
     assert len(int8_prefill._act_cache) <= 1
 
     assert int8_prefill.remove() is True
@@ -78,3 +107,151 @@ def test_int8_prefill_preserves_float32_semantics(monkeypatch):
 
     assert actual.dtype == reference.dtype == mx.float32
     assert bool(mx.array_equal(reference, actual).item())
+
+
+def test_ws_cache_serves_and_validates_live_entries():
+    mx.random.seed(11)
+    linear = _small_w4_linear()
+    ws = int8_prefill._ws_for(linear)
+    # Cache hit: same module returns the same array object.
+    assert int8_prefill._ws_for(linear) is ws
+    assert bool(mx.allclose(ws, _expected_ws(linear)).item())
+
+
+def test_ws_cache_ignores_stale_entry_after_id_reuse():
+    mx.random.seed(0)
+    first = _small_w4_linear()
+    stale_ws = int8_prefill._ws_for(first)
+    dead_ref = weakref.ref(first)
+    del first
+    gc.collect()
+    assert dead_ref() is None
+
+    mx.random.seed(1)
+    second = _small_w4_linear()
+    # Simulate CPython handing the new module the freed module's id(): plant
+    # the first model's cache entry under the second module's id. With the
+    # old id()-only keying this entry would be served as-is.
+    _clear_overlay_caches()
+    int8_prefill._ws_cache[id(second)] = (dead_ref, stale_ws)
+
+    ws = int8_prefill._ws_for(second)
+    assert ws is not stale_ws
+    assert bool(mx.allclose(ws, _expected_ws(second)).item())
+    assert not bool(mx.allclose(ws, stale_ws).item())
+    # The stale entry was replaced and the fresh one is served afterwards.
+    assert int8_prefill._ws_for(second) is ws
+
+
+def test_reaper_evicts_ws_cache(monkeypatch):
+    mx.random.seed(2)
+    live = _small_w4_linear()
+    dead = _small_w4_linear()
+    live_ws = int8_prefill._ws_for(live)
+    int8_prefill._ws_for(dead)
+    dead_key = id(dead)
+    del dead
+    gc.collect()
+
+    # Recently used: only entries whose module has been freed are pruned.
+    int8_prefill._touch()
+    int8_prefill._reap_once()
+    assert dead_key not in int8_prefill._ws_cache
+    assert int8_prefill._ws_for(live) is live_ws
+
+    # Idle past TTL_S: the whole scale cache is evicted.
+    monkeypatch.setattr(
+        int8_prefill,
+        "_last_use",
+        time.monotonic() - int8_prefill.TTL_S - 1.0,
+    )
+    int8_prefill._reap_once()
+    assert int8_prefill._ws_cache == {}
+
+
+def test_release_at_unload_boundary_flushes_scales_once(monkeypatch):
+    _fake_m5(monkeypatch)
+    assert int8_prefill.apply() is True
+
+    mx.random.seed(3)
+    first_model = _small_w4_linear()
+    stale_ws = int8_prefill._ws_for(first_model)
+    del first_model
+    gc.collect()
+
+    remove_calls = []
+    real_remove = int8_prefill.remove
+
+    def counting_remove():
+        result = real_remove()
+        remove_calls.append(result)
+        return result
+
+    monkeypatch.setattr(int8_prefill, "remove", counting_remove)
+
+    # The server's model-swap unload boundary: remove() runs exactly once,
+    # the first model's scales are flushed, and the patch is reinstalled so
+    # the next model keeps int8 prefill.
+    assert int8_prefill.release() is True
+    assert remove_calls == [True]
+    assert int8_prefill._ws_cache == {}
+    assert int8_prefill._int8_weights == {}
+    assert int8_prefill._original_quantized_linear_call is not None
+    assert int8_prefill._reaper_started is True
+
+    # The second model computes its own scales; nothing of the first model's
+    # cached state is visible after the swap.
+    mx.random.seed(4)
+    second_model = _small_w4_linear()
+    ws = int8_prefill._ws_for(second_model)
+    assert ws is not stale_ws
+    assert bool(mx.allclose(ws, _expected_ws(second_model)).item())
+    assert not bool(mx.allclose(ws, stale_ws).item())
+
+    # Process shutdown: remove() runs once more, the patch stays off and the
+    # reaper thread is stopped.
+    assert int8_prefill.release(reapply=False) is True
+    assert remove_calls == [True, True]
+    assert int8_prefill._original_quantized_linear_call is None
+    assert int8_prefill._reaper_started is False
+    assert int8_prefill._reaper_stop is None
+
+    # With the overlay gone, further unload boundaries are no-ops.
+    assert int8_prefill.release() is False
+    assert remove_calls == [True, True, False]
+
+
+def test_server_unload_paths_release_int8_overlay():
+    app_source = (
+        Path(__file__).parents[1] / "mlx_vlm" / "server" / "app.py"
+    ).read_text()
+    tree = ast.parse(app_source)
+    funcs = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def calls(func_name, callee):
+        for node in ast.walk(funcs[func_name]):
+            if isinstance(node, ast.Call):
+                target = node.func
+                if isinstance(target, ast.Name) and target.id == callee:
+                    return True
+                if isinstance(target, ast.Attribute) and target.attr == callee:
+                    return True
+        return False
+
+    # The app helper delegates to int8_prefill.release().
+    assert calls("_release_int8_prefill_overlay", "release")
+    # Every unload path reaches the helper:
+    #   - per-group unload (also the model-swap path and the sync loop)
+    assert calls("_unload_model_cache_group", "_release_int8_prefill_overlay")
+    #   - model swap funnels through the per-group unload
+    assert calls("get_cached_model", "_unload_model_cache_group")
+    #   - full sync unload (also the POST /unload endpoint)
+    assert calls("unload_model_sync", "_unload_model_cache_group")
+    assert calls("unload_model_sync", "_release_int8_prefill_overlay")
+    assert calls("unload_model_endpoint", "unload_model_sync")
+    #   - lifespan shutdown releases without reinstalling the patch
+    assert calls("lifespan", "_release_int8_prefill_overlay")
